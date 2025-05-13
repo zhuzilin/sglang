@@ -1933,7 +1933,7 @@ class Scheduler(
 
         # Sort in reverse order to avoid index issues when deleting
         for i in sorted(to_del, reverse=True):
-            req = self.waiting_queue.pop(i)
+            self.waiting_queue[i].to_abort = True
             logger.debug(f"Abort queued request. {req.rid=}")
             return
 
