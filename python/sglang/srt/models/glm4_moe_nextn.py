@@ -14,6 +14,7 @@
 
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 Speculative Decoding."""
 
+import contextlib
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -22,6 +23,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.environ import temp_set_env
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -34,12 +36,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import BumpAllocator, add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
 
 class Glm4MoeModelNextN(nn.Module):
+    decoder_layer_cls = Glm4MoeDecoderLayer
+    decoder_needs_zero_allocator = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -67,7 +72,7 @@ class Glm4MoeModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.decoder = Glm4MoeDecoderLayer(
+        self.decoder = self.decoder_layer_cls(
             config,
             0,
             quant_config=quant_config,
@@ -103,9 +108,19 @@ class Glm4MoeModelNextN(nn.Module):
 
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = self.decoder(
-                positions, hidden_states, forward_batch, residual
-            )
+            if self.decoder_needs_zero_allocator:
+                zero_allocator = BumpAllocator(
+                    buffer_size=2 * (2 if forward_batch.can_run_tbo else 1),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+                hidden_states, residual, _ = self.decoder(
+                    positions, hidden_states, forward_batch, residual, zero_allocator
+                )
+            else:
+                hidden_states, residual = self.decoder(
+                    positions, hidden_states, forward_batch, residual
+                )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
@@ -117,6 +132,8 @@ class Glm4MoeModelNextN(nn.Module):
 
 
 class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
+    model_cls = Glm4MoeModelNextN
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -126,14 +143,19 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.needs_quant_draft = (
+            get_global_server_args().speculative_draft_model_quantization is not None
+            or quant_config is not None
+        )
         if (
             is_npu()
             and get_global_server_args().speculative_draft_model_quantization is None
         ):
             quant_config = None
+            self.needs_quant_draft = False
+        quant_config = quant_config if self.needs_quant_draft else None
         self.quant_config = quant_config
-
-        self.model = Glm4MoeModelNextN(
+        self.model = self.model_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -156,7 +178,18 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        if self.needs_quant_draft:
+            cxt = contextlib.nullcontext()
+        else:
+            cxt = temp_set_env(
+                allow_sglang=True,
+                SGLANG_DEEPEP_BF16_DISPATCH="1",
+                DEEP_NORMAL_MODE_USE_INT8_QUANT="0",
+            )
+
+        with cxt:
+            hidden_states = self.model(input_ids, positions, forward_batch)
+
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -165,4 +198,22 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         super().load_weights(weights, is_nextn=True)
 
 
-EntryClass = [Glm4MoeForCausalLMNextN]
+from sglang.srt.models.glm4_moe_lite import (
+    Glm4MoeLiteDecoderLayer,
+    Glm4MoeLiteForCausalLM,
+)
+
+
+class Glm4MoeLiteModelNextN(Glm4MoeModelNextN):
+    decoder_layer_cls = Glm4MoeLiteDecoderLayer
+    decoder_needs_zero_allocator = True
+
+
+class Glm4MoeLiteForCausalLMNextN(Glm4MoeForCausalLMNextN, Glm4MoeLiteForCausalLM):
+    model_cls = Glm4MoeLiteModelNextN
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        Glm4MoeLiteForCausalLM.load_weights(self, weights, is_nextn=True)
+
+
+EntryClass = [Glm4MoeForCausalLMNextN, Glm4MoeLiteForCausalLMNextN]
