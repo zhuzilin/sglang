@@ -162,7 +162,7 @@ class SchedulerOutputStreamer:
             load=load,
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
-            has_reqs=bool(reqs),
+            has_reqs=bool(acc.rids),
         )
         if payload is not None:
             self.send_to_detokenizer.send_output(payload)
