@@ -547,8 +547,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+        # CPU offload. Draft workers should not overwrite the main model offloader.
+        if not is_draft_worker:
+            set_offloader(
+                create_offloader_from_server_args(server_args, dp_rank=dp_rank)
+            )
 
         self._weight_checker = WeightChecker(model_runner=self)
 
@@ -796,7 +799,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.maybe_init_ngram_embedding()
 
         # Init routed experts capturer
-        self.init_routed_experts_capturer()
+        if not self.is_draft_worker:
+            self.init_routed_experts_capturer()
 
         self.init_indexer_capturer()
 
