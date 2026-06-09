@@ -3468,11 +3468,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
+        # In speculative decoding, num_tokens_per_bs can be greater than one.
+        cuda_graph_num_tokens = None
+        if getattr(self.graph_runner, "bs", None):
+            cuda_graph_num_tokens = self.graph_runner.bs * getattr(
+                self.graph_runner, "num_tokens_per_bs", 1
+            )
         if (experts_capturer := get_global_experts_capturer()) is not None:
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -3480,7 +3486,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
