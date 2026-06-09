@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -631,13 +632,35 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
+        bootstrap_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             if poll == KVPoll.Bootstrapping:
-                pass
+                entry_time = getattr(
+                    decode_req.req.time_stats,
+                    "decode_prealloc_queue_entry_time",
+                    None,
+                )
+                if entry_time is not None and (now - entry_time) > bootstrap_timeout:
+                    error_message = (
+                        f"Decode bootstrap timed out after {now - entry_time:.1f}s "
+                        f"for request rank={self.tp_rank} "
+                        f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    )
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
@@ -1602,6 +1625,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         transferred_reqs = []
         indices_to_remove = set()
+        transfer_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1674,7 +1701,35 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 KVPoll.WaitingForInput,
                 KVPoll.Transferring,
             ]:
-                pass
+                entry_time = getattr(
+                    decode_req.req.time_stats,
+                    "decode_transfer_queue_entry_time",
+                    None,
+                )
+                if entry_time is not None and (now - entry_time) > transfer_timeout:
+                    error_message = (
+                        f"Decode transfer timed out after {now - entry_time:.1f}s "
+                        f"(state={poll}) for request rank={self.tp_rank} "
+                        f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    decode_req.kv_receiver.abort()
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    )
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if self.scheduler.enable_hisparse:
+                        self.scheduler.hisparse_coordinator.request_finished(
+                            decode_req.req
+                        )
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    indices_to_remove.add(i)
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_transfer_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
