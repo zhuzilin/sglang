@@ -567,6 +567,28 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            # An AbortReq may arrive while this prefill batch is already running.
+            # Honor it before exposing KV to the decode side.
+            req.check_finished()
+            if req.finished():
+                if req.inflight_middle_chunks <= 0:
+                    req.time_stats.set_prefill_finished_time()
+                else:
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+
+                advance_logprob_pt(i, req)
+                release_kv_cache(req, self.tree_cache)
+                req.time_stats.set_completion_time()
+                if req.grammar is not None:
+                    req.grammar.finished = True
+                self.output_streamer.stream_output([req], req.return_logprob, None)
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
+                continue
+
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
