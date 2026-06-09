@@ -993,16 +993,15 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
-                if len(src_indices) > len(dst_indices_local):
-                    logger.warning(
-                        f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
+                if len(src_indices) != len(dst_indices_local):
+                    logger.error(
+                        "PD extra-state index mismatch, reject transfer to avoid "
+                        "corrupted outputs: "
+                        f"state_type={st}, "
+                        f"len(prefill_state_indices)={len(src_indices)}, "
+                        f"len(dst_state_indices)={len(dst_indices_local)}"
                     )
-                    src_indices = src_indices[: len(dst_indices_local)]
-                elif len(src_indices) < len(dst_indices_local):
-                    logger.warning(
-                        f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
-                    )
-                    dst_indices_local = dst_indices_local[: len(src_indices)]
+                    return -1
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
@@ -1301,13 +1300,31 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices:
-                                self.maybe_send_extra(
+                            if kv_chunk.state_indices is not None:
+                                ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if ret != 0:
+                                    remote_addr = NetworkAddress(
+                                        req.endpoint, req.dst_port
+                                    ).to_host_port_str()
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Failed to send extra state chunk of {kv_chunk.room} to "
+                                        f"{remote_addr}",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
