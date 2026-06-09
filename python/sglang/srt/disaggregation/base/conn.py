@@ -35,6 +35,7 @@ class KVArgs:
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
+    aux_buffer_names: List[str]
     state_types: List[StateType]
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]

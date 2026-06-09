@@ -39,7 +39,11 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+    iter_aux_transfer_specs,
+)
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.observability.mooncake_trace import (
@@ -827,10 +831,14 @@ class MooncakeKVManager(CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
-            length = prefill_aux_item_lens[i]
-            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
+        for _, src_addr, dst_addr, length in iter_aux_transfer_specs(
+            self.kv_args.aux_buffer_names,
+            prefill_aux_ptrs,
+            prefill_aux_item_lens,
+            dst_aux_ptrs,
+            prefill_aux_index,
+            req.dst_aux_index,
+        ):
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -844,9 +852,14 @@ class MooncakeKVManager(CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        for i in range(len(prefill_aux_ptrs)):
-            length = prefill_aux_item_lens[i]
-            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+        for i, src_addr, _, length in iter_aux_transfer_specs(
+            self.kv_args.aux_buffer_names,
+            prefill_aux_ptrs,
+            prefill_aux_item_lens,
+            dst_aux_ptrs,
+            prefill_aux_index,
+            req.dst_aux_index,
+        ):
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
 
             self.send_aux_data_to_endpoint(

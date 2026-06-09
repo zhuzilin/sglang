@@ -23,7 +23,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from typing_extensions import Self
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    is_slime_profiling_enabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
@@ -577,6 +580,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     # Number of prefill retries for this request
     prefill_retry_count: int = 0
+    fwd_prefill_bootstrap_queue_duration: Optional[float] = None
+    fwd_prefill_forward_duration: Optional[float] = None
+    fwd_prefill_transfer_queue_duration: Optional[float] = None
+    fwd_prefill_bootstrap_duration: Optional[float] = None
+    fwd_prefill_alloc_wait_duration: Optional[float] = None
+    fwd_transfer_speed_gb_s: Optional[float] = None
+    fwd_transfer_total_mb: Optional[float] = None
+    fwd_prefill_retry_count: Optional[int] = None
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
@@ -584,10 +595,35 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             return {}
 
         state = {
+            "disagg_mode": self.disagg_mode,
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "completion_time": self.completion_time,
+            "prefill_bootstrap_queue_entry_time": (
+                self.prefill_bootstrap_queue_entry_time
+            ),
+            "prefill_transfer_queue_entry_time": self.prefill_transfer_queue_entry_time,
+            "decode_prealloc_queue_entry_time": self.decode_prealloc_queue_entry_time,
+            "decode_transfer_queue_entry_time": self.decode_transfer_queue_entry_time,
+            "bootstrap_done_time": self.bootstrap_done_time,
+            "transfer_speed_gb_s": self.transfer_speed_gb_s,
+            "transfer_total_mb": self.transfer_total_mb,
+            "prefill_retry_count": self.prefill_retry_count,
+            "fwd_prefill_bootstrap_queue_duration": (
+                self.fwd_prefill_bootstrap_queue_duration
+            ),
+            "fwd_prefill_forward_duration": self.fwd_prefill_forward_duration,
+            "fwd_prefill_transfer_queue_duration": self.fwd_prefill_transfer_queue_duration,
+            "fwd_prefill_bootstrap_duration": self.fwd_prefill_bootstrap_duration,
+            "fwd_prefill_alloc_wait_duration": self.fwd_prefill_alloc_wait_duration,
+            "fwd_transfer_speed_gb_s": self.fwd_transfer_speed_gb_s,
+            "fwd_transfer_total_mb": self.fwd_transfer_total_mb,
+            "fwd_prefill_retry_count": self.fwd_prefill_retry_count,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
+            # Preserve enable_metrics across IPC hops so forwarded PD timing
+            # fields are not stripped by the receiving side's dataclass default.
+            "enable_metrics": self.enable_metrics,
         }
         return state
 
@@ -987,6 +1023,176 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 
+    def get_prefill_waiting_latency(self) -> Optional[float]:
+        prefill_run_batch_start_time = getattr(
+            self, "prefill_run_batch_start_time", 0.0
+        )
+        if prefill_run_batch_start_time > 0.0:
+            return prefill_run_batch_start_time - self.forward_entry_time
+        return None
+
+    def get_prefill_launch_latency(self) -> Optional[float]:
+        prefill_run_batch_start_time = getattr(
+            self, "prefill_run_batch_start_time", 0.0
+        )
+        prefill_run_batch_end_time = getattr(self, "prefill_run_batch_end_time", 0.0)
+        if prefill_run_batch_start_time > 0.0 and prefill_run_batch_end_time > 0.0:
+            return prefill_run_batch_end_time - prefill_run_batch_start_time
+        return None
+
+    def get_pd_prefill_bootstrap_queue_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if self.fwd_prefill_bootstrap_queue_duration is not None:
+            return self.fwd_prefill_bootstrap_queue_duration
+        if (
+            self.disagg_mode == DisaggregationMode.PREFILL
+            and self.prefill_bootstrap_queue_entry_time > 0.0
+            and self.wait_queue_entry_time > 0.0
+        ):
+            return self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
+        return None
+
+    def get_pd_prefill_forward_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if self.fwd_prefill_forward_duration is not None:
+            return self.fwd_prefill_forward_duration
+        if (
+            self.disagg_mode == DisaggregationMode.PREFILL
+            and self.forward_entry_time > 0.0
+            and self.completion_time > 0.0
+        ):
+            return self.completion_time - self.forward_entry_time
+        return None
+
+    def get_pd_prefill_transfer_queue_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if self.fwd_prefill_transfer_queue_duration is not None:
+            return self.fwd_prefill_transfer_queue_duration
+        if (
+            self.disagg_mode == DisaggregationMode.PREFILL
+            and self.prefill_transfer_queue_entry_time > 0.0
+            and self.completion_time > 0.0
+        ):
+            return self.completion_time - self.prefill_transfer_queue_entry_time
+        return None
+
+    def get_pd_decode_prealloc_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if (
+            self.disagg_mode == DisaggregationMode.DECODE
+            and self.decode_prealloc_queue_entry_time > 0.0
+            and self.decode_transfer_queue_entry_time > 0.0
+        ):
+            return (
+                self.decode_transfer_queue_entry_time
+                - self.decode_prealloc_queue_entry_time
+            )
+        return None
+
+    def get_pd_decode_transfer_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if (
+            self.disagg_mode == DisaggregationMode.DECODE
+            and self.decode_transfer_queue_entry_time > 0.0
+            and self.wait_queue_entry_time > 0.0
+        ):
+            return self.wait_queue_entry_time - self.decode_transfer_queue_entry_time
+        return None
+
+    def get_pd_decode_forward_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if (
+            self.disagg_mode == DisaggregationMode.DECODE
+            and self.forward_entry_time > 0.0
+            and self.completion_time > 0.0
+        ):
+            return self.completion_time - self.forward_entry_time
+        return None
+
+    def get_pd_prefill_bootstrap_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if self.fwd_prefill_bootstrap_duration is not None:
+            return self.fwd_prefill_bootstrap_duration
+        if (
+            self.disagg_mode == DisaggregationMode.PREFILL
+            and self.prefill_bootstrap_queue_entry_time > 0.0
+            and self.bootstrap_done_time > 0.0
+        ):
+            return self.bootstrap_done_time - self.prefill_bootstrap_queue_entry_time
+        return None
+
+    def get_pd_prefill_alloc_wait_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if self.fwd_prefill_alloc_wait_duration is not None:
+            return self.fwd_prefill_alloc_wait_duration
+        if (
+            self.disagg_mode == DisaggregationMode.PREFILL
+            and self.bootstrap_done_time > 0.0
+            and self.wait_queue_entry_time > 0.0
+        ):
+            return self.wait_queue_entry_time - self.bootstrap_done_time
+        return None
+
+    def get_pd_decode_bootstrap_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if (
+            self.disagg_mode == DisaggregationMode.DECODE
+            and self.decode_prealloc_queue_entry_time > 0.0
+            and self.bootstrap_done_time > 0.0
+        ):
+            return self.bootstrap_done_time - self.decode_prealloc_queue_entry_time
+        return None
+
+    def get_pd_decode_alloc_wait_duration(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if (
+            self.disagg_mode == DisaggregationMode.DECODE
+            and self.bootstrap_done_time > 0.0
+            and self.decode_transfer_queue_entry_time > 0.0
+        ):
+            return self.decode_transfer_queue_entry_time - self.bootstrap_done_time
+        return None
+
+    def get_pd_transfer_speed_gb_s(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if self.fwd_transfer_speed_gb_s is not None:
+            return self.fwd_transfer_speed_gb_s
+        if (
+            self.disagg_mode != DisaggregationMode.NULL
+            and self.transfer_speed_gb_s > 0.0
+        ):
+            return self.transfer_speed_gb_s
+        return None
+
+    def get_pd_transfer_total_mb(self) -> Optional[float]:
+        if not is_slime_profiling_enabled():
+            return None
+        if self.fwd_transfer_total_mb is not None:
+            return self.fwd_transfer_total_mb
+        if self.disagg_mode != DisaggregationMode.NULL and self.transfer_total_mb > 0.0:
+            return self.transfer_total_mb
+        return None
+
+    def get_pd_prefill_retry_count(self) -> Optional[int]:
+        if not is_slime_profiling_enabled():
+            return None
+        if self.fwd_prefill_retry_count is not None:
+            return self.fwd_prefill_retry_count
+        if self.disagg_mode == DisaggregationMode.PREFILL:
+            return self.prefill_retry_count
+        return None
+
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
             queue_duration = self.duration_between(
@@ -1120,6 +1326,26 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 "queue_time": self.get_queueing_time(),
             }
         )
+        if is_slime_profiling_enabled():
+            for key, value in {
+                "pd_prefill_bootstrap_queue_duration": (
+                    self.get_pd_prefill_bootstrap_queue_duration()
+                ),
+                "pd_prefill_forward_duration": self.get_pd_prefill_forward_duration(),
+                "pd_prefill_transfer_queue_duration": self.get_pd_prefill_transfer_queue_duration(),
+                "pd_prefill_bootstrap_duration": self.get_pd_prefill_bootstrap_duration(),
+                "pd_prefill_alloc_wait_duration": self.get_pd_prefill_alloc_wait_duration(),
+                "pd_decode_prealloc_duration": self.get_pd_decode_prealloc_duration(),
+                "pd_decode_transfer_duration": self.get_pd_decode_transfer_duration(),
+                "pd_decode_forward_duration": self.get_pd_decode_forward_duration(),
+                "pd_decode_bootstrap_duration": self.get_pd_decode_bootstrap_duration(),
+                "pd_decode_alloc_wait_duration": self.get_pd_decode_alloc_wait_duration(),
+                "pd_transfer_speed_gb_s": self.get_pd_transfer_speed_gb_s(),
+                "pd_transfer_total_mb": self.get_pd_transfer_total_mb(),
+                "pd_prefill_retry_count": self.get_pd_prefill_retry_count(),
+            }.items():
+                if value is not None:
+                    meta_data[key] = value
         return meta_data
 
     def format_duration(self, duration: float) -> str:

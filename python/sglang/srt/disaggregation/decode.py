@@ -50,7 +50,9 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    apply_prefill_timing_payload,
     get_kv_class,
+    is_slime_profiling_enabled,
     is_mla_backend,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
@@ -425,6 +427,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+        kv_args.aux_buffer_names = self.metadata_buffers.get_aux_buffer_names()
 
         setup_state_kv_args(
             kv_args,
@@ -1455,6 +1458,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_topk_index,
             output_hidden_states,
             output_bootstrap_room,
+            output_prefill_timing,
         ) = self.metadata_buffers.get_buf(idx)
 
         # Validate bootstrap_room to detect context corruption
@@ -1541,6 +1545,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 output_top_logprobs_idx[
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
+            )
+
+        if is_slime_profiling_enabled():
+            apply_prefill_timing_payload(
+                decode_req.req.time_stats, output_prefill_timing
             )
 
         decode_req.kv_receiver.clear()
@@ -1690,6 +1699,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # Reset so the next owner sees actual_room == 0 ("not yet written")
             # instead of the stale value, avoiding a false-positive mismatch.
             self.metadata_buffers.bootstrap_room[idx] = 0
+            self.metadata_buffers.clear_profiling_buf(idx)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [

@@ -943,6 +943,9 @@ class Req(ReqDllmMixin):
         self.metrics_collector = metrics_collector
         if time_stats is not None:
             self.time_stats = SchedulerReqTimeStats.new_from_obj(time_stats)
+            # API-server stats are created with NULL disagg_mode; keep the
+            # scheduler-side mode so PD timing getters can select the right path.
+            self.time_stats.disagg_mode = disagg_mode
         else:
             self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
         self.time_stats.set_metrics_collector(metrics_collector)
